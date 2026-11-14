@@ -1,2192 +1,671 @@
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ReactNode,
-} from "react";
-import {
-  Activity,
-  ArrowDownToLine,
-  ArrowRight,
-  AudioLines,
-  Camera,
-  Check,
-  ChevronDown,
-  ChevronRight,
-  CircleHelp,
-  Copy,
-  Drum,
-  FolderOpen,
-  Gamepad2,
-  Hand,
-  Headphones,
-  Keyboard,
-  Layers3,
-  LoaderCircle,
-  PanelRightClose,
-  PanelRightOpen,
-  Piano,
-  Play,
-  Plus,
-  RotateCcw,
-  Save,
-  ScanLine,
-  Settings2,
-  SlidersHorizontal,
-  Sparkles,
-  Square,
-  SquareMousePointer,
-  Trash2,
-  Undo2,
-  Volume2,
-  Waves,
-  X,
-} from "lucide-react";
+import { useCallback, useEffect, useRef, useState, type PointerEvent } from "react";
+import { Camera, ImageUp, Play, RotateCcw, Trophy, X, LoaderCircle, Music } from "lucide-react";
 import { AudioEngine } from "./lib/audio";
 import { CameraController } from "./lib/camera";
 import { HandTracker, type HandFrame } from "./lib/tracking";
-import { MidiController } from "./lib/midi";
-import {
-  computeHomography,
-  controlsOverlap,
-  pointInPolygon,
-  transformPoint,
-  validateControlPolygon,
-  validateCorners,
-} from "./lib/geometry";
-import { recognizeControls, rectifyImage } from "./lib/recognition";
-import {
-  INITIAL_CORNERS,
-  createDefaultLayout,
-  isLayout,
-  readSavedLayout,
-  saveLayout,
-} from "./lib/layout";
-import {
-  KEY_BINDINGS,
-  noteName,
-  type ControlEvent,
-  type Corners,
-  type Mode,
-  type PaperControl,
-  type PaperLayout,
-  type Point,
-  type Skin,
-  type Stage,
-} from "./types";
-import PaperStage from "./components/PaperStage";
-import MiniGame from "./components/MiniGame";
-const MODES: {
-  id: Mode;
-  name: string;
-  icon: typeof Piano;
-  description: string;
-}[] = [
-  {
-    id: "piano",
-    name: "Piano",
-    icon: Piano,
-    description: "A little paper. A lot of possibility.",
-  },
-  {
-    id: "chords",
-    name: "Chords",
-    icon: Layers3,
-    description: "One touch. A room full of harmony.",
-  },
-  {
-    id: "drums",
-    name: "Drums",
-    icon: Drum,
-    description: "Find a rhythm in the everyday.",
-  },
-  {
-    id: "soundboard",
-    name: "Sounds",
-    icon: AudioLines,
-    description: "Small gestures. Unexpected sounds.",
-  },
-  {
-    id: "game",
-    name: "Play",
-    icon: Gamepad2,
-    description: "Your paper has a playful side.",
-  },
+import { hitControl } from "./lib/geometry";
+import { recognizeControls } from "./lib/recognition";
+import { aiToControls, BASE_OCTAVE, controlName, DRUMS, FX, SHAPE_VOICE, voiceOf, type Voice } from "./lib/aiLayout";
+import { findRegions, inkMap, mergeShapes } from "./lib/regions";
+import type { AiShape } from "../server/identify";
+import { TapDetector } from "./lib/tap";
+import { noteName, type ControlAction, type ControlEvent, type PaperControl, type Point } from "./types";
+
+type Step = "scan" | "play";
+type Usage = { scans: number; inTokens: number; outTokens: number; costUsd: number; budgetUsd: number; ai?: boolean };
+
+const KEYS = "asdfghjkl;qwertyuiop".split("");
+const NOTES = Array.from({ length: 61 }, (_, i) => 36 + i); // C2..C7
+const GAME_SECONDS = 30;
+const TARGET_MS = 2200; // a lit shape moves on if you don't hit it in time
+
+const VOICES: [Voice, string][] = [
+  ["piano", "Piano"], ["marimba", "Marimba"], ["guitar", "Guitar"], ["bass", "Bass"],
+  ["organ", "Organ"], ["synth", "Synth"], ["drums", "Drums"], ["fx", "Sound FX"],
 ];
-const UNIT: Corners = [
-  [0, 0],
-  [1, 0],
-  [1, 1],
-  [0, 1],
-];
-function mappedControl(c: PaperControl, mode: Mode, i: number): PaperControl {
-  if (mode === "chords")
-    return { ...c, action: { type: "note", midi: [60, 57, 53, 55][i % 4] } };
-  if (mode === "drums")
-    return {
-      ...c,
-      action: { type: "sound", sound: ["kick", "snare", "hat", "clap"][i % 4] },
-    };
-  if (mode === "soundboard")
-    return {
-      ...c,
-      action: {
-        type: "sound",
-        sound: ["chime", "orbit", "pulse", "bloom"][i % 4],
-      },
-    };
-  if (mode === "game")
-    return {
-      ...c,
-      action: {
-        type: "game",
-        action: ["left", "jump", "right", "reset"][i % 4],
-      },
-    };
-  return c;
+const VOICE_NAME = Object.fromEntries(VOICES) as Record<Voice, string>;
+const SHAPE_GLYPH: Record<AiShape["shape"], string> = { rectangle: "▭", circle: "◯", triangle: "△", diamond: "◇", star: "☆", other: "⬠" };
+/** A finger that vanishes for less than this (tracker dropout) keeps its press state. */
+const FINGER_GRACE_MS = 160;
+const label = (a: ControlAction) =>
+  a.type === "note" ? noteName(a.midi) : a.type === "sound" ? a.sound[0].toUpperCase() + a.sound.slice(1) : a.action;
+
+/** Area centroid (where a label looks centred), falling back to the vertex average for slivers. */
+const center = (p: Point[]): Point => {
+  let a = 0, cx = 0, cy = 0;
+  p.forEach(([x0, y0], i) => {
+    const [x1, y1] = p[(i + 1) % p.length], k = x0 * y1 - x1 * y0;
+    a += k; cx += (x0 + x1) * k; cy += (y0 + y1) * k;
+  });
+  if (Math.abs(a) < 1e-9) return [p.reduce((s, q) => s + q[0], 0) / p.length, p.reduce((s, q) => s + q[1], 0) / p.length];
+  return [cx / (3 * a), cy / (3 * a)];
+};
+
+/** Demo paper: 8 keys plus 4 round drum pads, for trying it without a drawing. */
+function demoControls(): PaperControl[] {
+  const keys: PaperControl[] = [60, 62, 64, 65, 67, 69, 71, 72].map((midi, i) => ({
+    id: `demo-k${i}`,
+    kind: "key",
+    name: noteName(midi),
+    polygon: [[0.06 + i * 0.111, 0.42], [0.155 + i * 0.111, 0.42], [0.155 + i * 0.111, 0.92], [0.06 + i * 0.111, 0.92]],
+    action: { type: "note", midi },
+  }));
+  const pads: PaperControl[] = DRUMS.map((sound, i) => ({
+    id: `demo-d${i}`,
+    kind: "pad",
+    name: sound,
+    polygon: Array.from({ length: 12 }, (_, k) => {
+      const a = (k / 12) * Math.PI * 2;
+      return [0.2 + i * 0.2 + Math.cos(a) * 0.065, 0.2 + Math.sin(a) * 0.1] as Point;
+    }),
+    action: { type: "sound", sound },
+  }));
+  return [...pads, ...keys];
 }
-function IconButton({
-  label,
-  children,
-  onClick,
-  active = false,
-}: {
-  label: string;
-  children: ReactNode;
-  onClick: () => void;
-  active?: boolean;
-}) {
-  return (
-    <button
-      className={`icon-button ${active ? "active" : ""}`}
-      aria-label={label}
-      title={label}
-      onClick={onClick}
-    >
-      {children}
-    </button>
-  );
+
+function loadImage(src: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const im = new Image();
+    im.onload = () => resolve(im);
+    im.onerror = () => reject(new Error("Could not read that image."));
+    im.src = src;
+  });
 }
-function Toggle({
-  checked,
-  onChange,
-  label,
-}: {
-  checked: boolean;
-  onChange: () => void;
-  label: string;
-}) {
-  return (
-    <button
-      className={`toggle ${checked ? "on" : ""}`}
-      role="switch"
-      aria-checked={checked}
-      aria-label={label}
-      onClick={onChange}
-    >
-      <span />
-    </button>
-  );
+
+/** Any image/video frame -> JPEG canvas at most 1024 px wide (keeps Gemini cost down). */
+function toCanvas(src: HTMLVideoElement | HTMLImageElement) {
+  const w = "videoWidth" in src ? src.videoWidth : src.naturalWidth;
+  const h = "videoHeight" in src ? src.videoHeight : src.naturalHeight;
+  const s = Math.min(1, 1024 / w);
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(w * s);
+  canvas.height = Math.round(h * s);
+  canvas.getContext("2d")!.drawImage(src, 0, 0, canvas.width, canvas.height);
+  return canvas;
 }
-function Range({
-  label,
-  value,
-  min = 0,
-  max = 1,
-  step = 0.01,
-  onChange,
-  display,
-}: {
-  label: string;
-  value: number;
-  min?: number;
-  max?: number;
-  step?: number;
-  onChange: (v: number) => void;
-  display: string;
-}) {
-  return (
-    <label className="range-control">
-      <span>
-        {label}
-        <output>{display}</output>
-      </span>
-      <input
-        aria-label={label}
-        type="range"
-        min={min}
-        max={max}
-        step={step}
-        value={value}
-        onChange={(e) => onChange(+e.target.value)}
-        style={
-          {
-            "--range-fill": `${(100 * (value - min)) / (max - min)}%`,
-          } as React.CSSProperties
-        }
-      />
-    </label>
-  );
+
+function readBest() {
+  try {
+    return Number(localStorage.getItem("paperpilot.best")) || 0;
+  } catch {
+    return 0;
+  }
 }
 
 export default function App() {
-  const [stage, setStage] = useState<Stage>("setup"),
-    [mode, setMode] = useState<Mode>("piano");
-  const [layout, setLayout] = useState<PaperLayout>(createDefaultLayout),
-    [saved, setSaved] = useState(readSavedLayout);
-  const [selected, setSelected] = useState<string | null>(null),
-    [history, setHistory] = useState<PaperLayout[]>([]);
-  const [stream, setStream] = useState<MediaStream | null>(null),
-    [devices, setDevices] = useState<MediaDeviceInfo[]>([]),
-    [deviceId, setDeviceId] = useState("");
-  const [cameraBusy, setCameraBusy] = useState(false),
-    [cameraError, setCameraError] = useState(""),
-    [video, setVideo] = useState<HTMLVideoElement | null>(null);
-  const [snapshot, setSnapshot] = useState<string | null>(null),
-    [corners, setCorners] = useState<Corners>(INITIAL_CORNERS),
-    [editCorners, setEditCorners] = useState(false),
-    [calibrated, setCalibrated] = useState(false);
-  const [trackingState, setTrackingState] = useState<
-      "idle" | "loading" | "ready" | "error"
-    >("idle"),
-    [input, setInput] = useState<"keyboard" | "vision" | "midi">("keyboard"),
-    [midiLabel, setMidiLabel] = useState("Not connected");
-  const [soundReady, setSoundReady] = useState(false),
-    [soundBusy, setSoundBusy] = useState(false),
-    [audioState, setAudioState] = useState("suspended");
-  const [active, setActive] = useState<Set<string>>(new Set()),
-    [gameActions, setGameActions] = useState<Set<string>>(new Set()),
-    [tip, setTip] = useState<Point | null>(null);
-  const [augmented, setAugmented] = useState(true),
-    [intensity, setIntensity] = useState(0.9),
-    [inspector, setInspector] = useState(() => window.innerWidth > 800),
-    [settings, setSettings] = useState(false),
-    [help, setHelp] = useState(false);
-  const [volume, setVolume] = useState(0.72),
-    [octave, setOctave] = useState(0),
-    [release, setRelease] = useState(0.45),
-    [sustain, setSustain] = useState(false),
-    [effect, setEffect] = useState(0.12),
-    [preset, setPreset] = useState<"piano" | "felt" | "synth">("piano");
-  const [bpm, setBpm] = useState(100),
-    [metronome, setMetronome] = useState(false),
-    [playing, setPlaying] = useState(false),
-    [beat, setBeat] = useState(0),
-    [level, setLevel] = useState(0);
-  const [notice, setNotice] = useState(""),
-    [revealing, setRevealing] = useState(false),
-    [scanning, setScanning] = useState(false),
-    [, setTick] = useState(0);
-  const audio = useRef(new AudioEngine()),
-    camera = useRef(new CameraController()),
-    tracker = useRef(new HandTracker()),
-    midi = useRef(new MidiController());
-  const owners = useRef(new Map<string, Set<string>>()),
-    visionActive = useRef<string | null>(null),
-    visionArmed = useRef(false),
-    lastTipAt = useRef(0);
-  const stageContainer = useRef<HTMLDivElement>(null),
-    fileInput = useRef<HTMLInputElement>(null),
-    loopTimers = useRef<ReturnType<typeof setTimeout>[]>([]),
-    undoBase = useRef<PaperLayout | null>(null);
-  const readyPromise = useRef<Promise<boolean> | null>(null),
-    revealingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const current = useRef({
-    stage,
-    mode,
-    layout,
-    octave,
-    soundReady,
-    input,
-    calibrated,
-    corners,
-  });
-  current.current = {
-    stage,
-    mode,
-    layout,
-    octave,
-    soundReady,
-    input,
-    calibrated,
-    corners,
-  };
-  const modeInfo = MODES.find((m) => m.id === mode)!;
-  const overlaps = useMemo(
-    () => controlsOverlap(layout.controls),
-    [layout.controls],
-  );
-  const selectedControl = layout.controls.find((c) => c.id === selected);
-  const diagnostics = tracker.current.diagnostics;
-  const notify = useCallback((message: string) => setNotice(message), []);
+  const [step, setStep] = useState<Step>("scan");
+  const [stream, setStream] = useState<MediaStream | null>(null);
+  const [image, setImage] = useState<string | null>(null); // the scanned frame; null + no stream = demo paper
+  const [aspect, setAspect] = useState(16 / 10);
+  const [controls, setControls] = useState<PaperControl[]>([]);
+  const [shapes, setShapes] = useState<AiShape[]>([]); // last AI scan (outlines snapped to the ink)
+  const [useLetters, setUseLetters] = useState(true);
+  const [still, setStill] = useState(false); // labels belong to an uploaded photo / demo, not the live feed
+  const [busy, setBusy] = useState<"" | "camera" | "scan">("");
+  const [notice, setNotice] = useState("");
+  const [usage, setUsage] = useState<Usage | null>(null);
+  const [trackerReady, setTrackerReady] = useState(false);
+  const [active, setActive] = useState<Set<string>>(new Set());
+  const [hover, setHover] = useState<Set<string>>(new Set());
+  const [tips, setTips] = useState<Point[]>([]);
+  const [tab, setTab] = useState<"play" | "game">("play");
+  const [fingers, setFingers] = useState<1 | 2 | 10>(1);
+  const [game, setGame] = useState({ on: false, target: "", score: 0, combo: 0, left: 0, best: readBest(), pop: "" });
+
+  const audio = useRef(new AudioEngine());
+  const camera = useRef(new CameraController());
+  const tracker = useRef(new HandTracker());
+  const taps = useRef(new Map<string, TapDetector>()); // one per tracked fingertip
+  const seen = useRef(new Map<string, number>()); // fingertip -> last time it was tracked
+  const video = useRef<HTMLVideoElement | null>(null);
+  const fileInput = useRef<HTMLInputElement>(null);
+  // slot (an input, or one fingertip) -> what it is holding
+  const held = useRef(new Map<string, { id: string; source: ControlEvent["source"] }>());
+  const targetAt = useRef(0);
+  const live = useRef({ controls, aspect, game, tab, fingers });
+  live.current = { controls, aspect, game, tab, fingers };
+
+  useEffect(() => {
+    fetch("/api/usage").then((r) => r.json()).then(setUsage).catch(() => setUsage(null));
+  }, []);
   useEffect(() => {
     if (!notice) return;
-    const t = setTimeout(() => setNotice(""), 6500);
+    const t = setTimeout(() => setNotice(""), 6000);
     return () => clearTimeout(t);
   }, [notice]);
-  const stopAll = useCallback(() => {
-    loopTimers.current.forEach(clearTimeout);
-    loopTimers.current = [];
-    setPlaying(false);
-    setMetronome(false);
-    audio.current.stopAll();
-    audio.current.setSustain(false);
-    setSustain(false);
-    owners.current.clear();
-    visionActive.current = null;
-    visionArmed.current = false;
-    setActive(new Set());
-    setGameActions(new Set());
+
+  // ---- sound -------------------------------------------------------------
+  const wakeAudio = () => void audio.current.ready().catch((e) => setNotice(e.message));
+
+  const nextTarget = useCallback((avoid: string) => {
+    const ids = live.current.controls.map((c) => c.id).filter((id) => id !== avoid);
+    targetAt.current = performance.now();
+    return ids[Math.floor(Math.random() * ids.length)] ?? avoid;
   }, []);
-  const send = useCallback(
-    (
-      id: string,
-      phase: "down" | "up",
-      source: ControlEvent["source"] = "pointer",
-      ownerSuffix = "",
-    ) => {
-      const state = current.current;
-      if (state.stage !== "studio" || !state.soundReady) return;
-      const index = state.layout.controls.findIndex((c) => c.id === id);
-      if (index < 0) return;
-      const owner = `${source}${ownerSuffix}`;
-      const held = owners.current.get(id) || new Set<string>();
-      if (phase === "down" && held.has(owner)) return;
-      if (phase === "up" && !held.has(owner)) return;
-      const control = mappedControl(
-        state.layout.controls[index],
-        state.mode,
-        index,
-      );
-      // Audio dispatch happens before any React render or visual state update.
-      audio.current.trigger(
-        {
-          controlId: ownerSuffix ? `${id}:${ownerSuffix}` : id,
-          phase,
-          value: 1,
-          source,
-          timestampMs: performance.now(),
-        },
-        control,
-        state.mode,
-        state.octave,
-      );
-      if (phase === "down") held.add(owner);
-      else held.delete(owner);
-      if (held.size) owners.current.set(id, held);
-      else owners.current.delete(id);
-      setActive(new Set(owners.current.keys()));
-      if (state.mode === "game") {
-        const actions = new Set<string>();
-        for (const key of owners.current.keys()) {
-          const i = state.layout.controls.findIndex((c) => c.id === key);
-          actions.add(["left", "jump", "right", "reset"][i % 4]);
-        }
-        setGameActions(actions);
-      }
+
+  const release = useCallback((slot: string) => {
+    const h = held.current.get(slot);
+    const c = live.current.controls.find((x) => x.id === h?.id);
+    held.current.delete(slot);
+    if (c && h)
+      audio.current.trigger({ controlId: `${c.id}|${slot}`, phase: "up", value: 0, source: h.source, timestampMs: performance.now() }, c, "piano");
+    setActive(new Set([...held.current.values()].map((x) => x.id)));
+  }, []);
+
+  const press = useCallback(
+    (id: string, source: ControlEvent["source"], slot: string = source) => {
+      const c = live.current.controls.find((x) => x.id === id);
+      if (!c) return;
+      if (held.current.has(slot)) release(slot);
+      // Sound first, UI after: keeps latency down. Each finger owns its own voice.
+      audio.current.trigger({ controlId: `${id}|${slot}`, phase: "down", value: 1, source, timestampMs: performance.now() }, c, "piano");
+      held.current.set(slot, { id, source });
+      setActive(new Set([...held.current.values()].map((x) => x.id)));
+      const g = live.current.game;
+      if (live.current.tab !== "game" || !g.on) return;
+      if (id === g.target) {
+        const fast = performance.now() - targetAt.current < 900;
+        const points = 1 + Math.min(g.combo, 9) + (fast ? 2 : 0);
+        setGame((s) => ({ ...s, score: s.score + points, combo: s.combo + 1, target: nextTarget(id), pop: `+${points}${fast ? " fast!" : ""}` }));
+      } else setGame((s) => ({ ...s, combo: 0, pop: "miss" }));
     },
-    [],
+    [release, nextTarget],
   );
-  const prepareAudio = useCallback(async () => {
-    if (readyPromise.current) return readyPromise.current;
-    setSoundBusy(true);
-    readyPromise.current = (async () => {
-      try {
-        await audio.current.ready();
-        setSoundReady(true);
-        setAudioState("running");
-        const assets = audio.current.getDiagnostics();
-        if (assets.assetError)
-          notify(`${assets.preset}. ${assets.assetError}.`);
-        return true;
-      } catch (e) {
-        notify(e instanceof Error ? e.message : "Click to enable sound.");
-        return false;
-      } finally {
-        setSoundBusy(false);
-        readyPromise.current = null;
-      }
-    })();
-    return readyPromise.current;
-  }, [notify]);
-  useEffect(() => {
-    audio.current.setVolume(volume);
-  }, [volume]);
-  useEffect(() => {
-    audio.current.setRelease(release);
-  }, [release]);
-  useEffect(() => {
-    audio.current.setSustain(sustain);
-  }, [sustain]);
-  useEffect(() => {
-    audio.current.setEffect(effect);
-  }, [effect]);
-  useEffect(() => {
-    audio.current.setPreset(preset);
-  }, [preset]);
-  useEffect(() => {
-    camera.current
-      .listDevices()
-      .then(setDevices)
-      .catch(() => {});
-    const list = () =>
-      camera.current
-        .listDevices()
-        .then(setDevices)
-        .catch(() => {});
-    navigator.mediaDevices?.addEventListener("devicechange", list);
-    const onBlur = () => stopAll(),
-      onHidden = () => {
-        if (document.hidden) stopAll();
-      };
-    window.addEventListener("blur", onBlur);
-    document.addEventListener("visibilitychange", onHidden);
-    const meter = setInterval(() => {
-      const d = audio.current.getDiagnostics();
-      setLevel(d.level);
-      setAudioState(d.state);
-      setTick((n) => n + 1);
-    }, 100);
-    return () => {
-      navigator.mediaDevices?.removeEventListener("devicechange", list);
-      window.removeEventListener("blur", onBlur);
-      document.removeEventListener("visibilitychange", onHidden);
-      clearInterval(meter);
-      stopAll();
-      camera.current.stop();
-      tracker.current.stop();
-      midi.current.disconnect();
-    };
-  }, [stopAll]);
+
+  // ---- keyboard ----------------------------------------------------------
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
-      if (document.querySelector("[role=dialog]")) {
-        if (e.key === "Escape") {
-          stopAll();
-          setSettings(false);
-          setHelp(false);
-        }
-        return;
-      }
-      if (
-        e.target instanceof HTMLElement &&
-        (e.target.matches("input,textarea,select") ||
-          e.target.isContentEditable)
-      )
-        return;
-      if (e.key === "Escape") {
-        stopAll();
-        setSettings(false);
-        setHelp(false);
-        return;
-      }
-      const i = KEY_BINDINGS.indexOf(e.key.toLowerCase());
-      if (i >= 0 && !e.repeat && current.current.stage === "studio") {
+      if (e.repeat || (e.target as HTMLElement).matches?.("input,select,textarea")) return;
+      const c = live.current.controls[KEYS.indexOf(e.key.toLowerCase())];
+      if (c) {
         e.preventDefault();
-        const c = current.current.layout.controls[i];
-        if (c) send(c.id, "down", "keyboard");
+        press(c.id, "keyboard");
       }
     };
     const up = (e: KeyboardEvent) => {
-      const i = KEY_BINDINGS.indexOf(e.key.toLowerCase());
-      if (i >= 0) {
-        const c = current.current.layout.controls[i];
-        if (c) send(c.id, "up", "keyboard");
-      }
+      if (KEYS.includes(e.key.toLowerCase())) release("keyboard");
     };
-    window.addEventListener("keydown", down);
-    window.addEventListener("keyup", up);
+    addEventListener("keydown", down);
+    addEventListener("keyup", up);
     return () => {
-      window.removeEventListener("keydown", down);
-      window.removeEventListener("keyup", up);
+      removeEventListener("keydown", down);
+      removeEventListener("keyup", up);
     };
-  }, [send, stopAll]);
+  }, [press, release]);
+
+  // ---- camera + hand tracking ---------------------------------------------
+  const startCamera = async () => {
+    wakeAudio();
+    setBusy("camera");
+    try {
+      const s = await camera.current.start();
+      setStream(s);
+      setImage(null);
+      tracker.current.init().then(() => setTrackerReady(true)).catch((e) => setNotice(`Hand tracking off: ${e.message}`));
+    } catch (e) {
+      // A newer camera request replaced this one (React dev mounts twice): not an error.
+      if (e instanceof DOMException && e.name === "AbortError") return;
+      setNotice(e instanceof Error ? e.message : "Camera could not start.");
+    } finally {
+      setBusy("");
+    }
+  };
+  useEffect(() => {
+    void startCamera();
+    return () => camera.current.stop();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- once, on open
+  }, []);
+
   const onHand = useCallback(
-    (frame: HandFrame) => {
-      const s = current.current;
-      if (performance.now() - lastTipAt.current > 65 || !frame.tip) {
-        setTip(frame.tip);
-        lastTipAt.current = performance.now();
+    (f: HandFrame) => {
+      const { controls, aspect, fingers } = live.current;
+      // 1 = first index finger, 2 = both index fingers, 10 = every fingertip.
+      let use = fingers === 10 ? f.fingers : f.fingers.filter((x) => x.id.endsWith(":1"));
+      if (fingers === 1) use = use.slice(0, 1);
+      const hovered = new Set<string>();
+      for (const finger of use) {
+        seen.current.set(finger.id, f.timestampMs);
+        let d = taps.current.get(finger.id);
+        if (!d) taps.current.set(finger.id, (d = new TapDetector()));
+        const hit = hitControl(finger.tip, controls, aspect);
+        if (hit) hovered.add(hit.id);
+        const ev = d.update(f.timestampMs, finger.tip[1], finger.palmWidth);
+        if (ev === "lift") release(`vision:${finger.id}`);
+        if (ev === "tap" && hit) press(hit.id, "vision", `vision:${finger.id}`);
       }
-      if (
-        s.stage !== "studio" ||
-        s.input !== "vision" ||
-        !s.calibrated ||
-        !frame.tip
-      ) {
-        if (visionActive.current) send(visionActive.current, "up", "vision");
-        audio.current.releaseSource("vision");
-        visionActive.current = null;
-        visionArmed.current = false;
-        return;
-      }
-      if (frame.pinch > 0.5) {
-        if (visionActive.current) send(visionActive.current, "up", "vision");
-        visionActive.current = null;
-        visionArmed.current = true;
-        return;
-      }
-      if (frame.pinch < 0.35 && visionArmed.current && !visionActive.current) {
-        visionArmed.current = false;
-        try {
-          const inverse = computeHomography(s.corners, UNIT);
-          const paper = transformPoint(inverse, frame.tip);
-          const c = s.layout.controls.find((c) =>
-            pointInPolygon(paper, c.polygon),
-          );
-          if (c) {
-            send(c.id, "down", "vision");
-            visionActive.current = c.id;
-          }
-        } catch {}
-      }
+      // Fingers that left the frame (or the selection) let go, after a short grace for tracker dropouts.
+      for (const id of [...taps.current.keys()])
+        if (!use.some((x) => x.id === id) && f.timestampMs - (seen.current.get(id) ?? 0) > FINGER_GRACE_MS) {
+          taps.current.delete(id);
+          release(`vision:${id}`);
+        }
+      setTips(use.map((x) => x.tip));
+      setHover(hovered);
     },
-    [send],
+    [press, release],
   );
   useEffect(() => {
-    if (
-      !video ||
-      !stream ||
-      trackingState !== "ready" ||
-      stage !== "studio" ||
-      input !== "vision"
-    ) {
+    const v = video.current;
+    if (step !== "play" || busy === "scan" || still || !stream || !trackerReady || !v) return;
+    taps.current.clear();
+    try {
+      tracker.current.start(v, onHand);
+    } catch (e) {
+      setNotice(e instanceof Error ? e.message : "Hand tracking unavailable.");
+    }
+    return () => {
       tracker.current.stop();
-      setTip(null);
-      return;
-    }
-    try {
-      tracker.current.start(video, onHand);
-    } catch (e) {
-      notify(e instanceof Error ? e.message : "Tracking unavailable.");
-    }
-    return () => tracker.current.stop();
-  }, [video, stream, trackingState, stage, input, onHand, notify]);
-  useEffect(() => {
-    if (!stream) return;
-    const ended = () => {
-      stopAll();
-      setStream(null);
-      setCameraError("Reconnect your camera, then recalibrate your paper.");
-      setCalibrated(false);
-      setInput("keyboard");
+      for (const slot of [...held.current.keys()]) if (slot.startsWith("vision")) release(slot);
+      taps.current.clear();
+      setTips([]);
+      setHover(new Set());
     };
-    stream.getVideoTracks().forEach((t) => t.addEventListener("ended", ended));
-    return () =>
-      stream
-        .getVideoTracks()
-        .forEach((t) => t.removeEventListener("ended", ended));
-  }, [stream, stopAll]);
-  useEffect(() => {
-    if (!metronome || !soundReady) return;
-    let next = performance.now(),
-      n = 0;
-    const timer = setInterval(() => {
-      if (performance.now() >= next) {
-        audio.current.click(n % 4 === 0);
-        setBeat(n % 4);
-        n++;
-        next += 60000 / bpm;
-        if (next < performance.now() - 100)
-          next = performance.now() + 60000 / bpm;
-      }
-    }, 12);
-    return () => clearInterval(timer);
-  }, [metronome, bpm, soundReady]);
-  const startCamera = async (id = deviceId) => {
-    stopAll();
-    setCameraBusy(true);
-    setCameraError("");
-    setCalibrated(false);
-    setSnapshot(null);
-    void prepareAudio();
+  }, [step, busy, still, stream, trackerReady, onHand, release]);
+
+  // ---- scanning ------------------------------------------------------------
+  const scan = async (canvas: HTMLCanvasElement) => {
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+    setImage(dataUrl);
+    setAspect(canvas.width / canvas.height);
+    setControls([]);
+    setStep("play");
+    setBusy("scan");
     try {
-      const next = await camera.current.start(id || undefined);
-      setStream(next);
-      setDevices(await camera.current.listDevices());
-      setDeviceId(next.getVideoTracks()[0].getSettings().deviceId || id);
-      setTrackingState("loading");
-      tracker.current
-        .init()
-        .then(() => setTrackingState("ready"))
-        .catch((e) => {
-          setTrackingState("error");
-          notify(e.message);
+      let found: PaperControl[] = [];
+      try {
+        const res = await fetch("/api/identify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ image: dataUrl }),
         });
-    } catch (e) {
-      setStream(null);
-      setCameraError(
-        e instanceof Error ? e.message : "Camera could not start.",
-      );
-    } finally {
-      setCameraBusy(false);
-    }
-  };
-  const demo = async (savedLayout?: PaperLayout) => {
-    if (!(await prepareAudio())) return;
-    stopAll();
-    camera.current.stop();
-    setStream(null);
-    setSnapshot(null);
-    setCalibrated(false);
-    setInput("keyboard");
-    if (savedLayout) setLayout(savedLayout);
-    setStage("studio");
-    setAugmented(true);
-    notify("Demo layout ready. Play with A–K or click a key.");
-  };
-  const capture = () => {
-    stopAll();
-    if (!video || video.readyState < 2) {
-      notify("Wait for the camera frame, then try again.");
-      return;
-    }
-    const canvas = document.createElement("canvas");
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    canvas.getContext("2d")!.drawImage(video, 0, 0);
-    setSnapshot(canvas.toDataURL("image/jpeg", 0.93));
-    setStage("scan");
-    setEditCorners(true);
-    setAugmented(true);
-    setSelected(null);
-  };
-  const scan = async () => {
-    if (!validateCorners(corners)) {
-      notify("Place the four corners clockwise around a flat, visible sheet.");
-      return;
-    }
-    if (!snapshot) {
-      setEditCorners(false);
-      return;
-    }
-    setScanning(true);
-    try {
-      const image = await new Promise<HTMLImageElement>((resolve, reject) => {
-        const im = new Image();
-        im.onload = () => resolve(im);
-        im.onerror = reject;
-        im.src = snapshot;
-      });
-      const source = document.createElement("canvas");
-      source.width = image.naturalWidth;
-      source.height = image.naturalHeight;
-      source.getContext("2d")!.drawImage(image, 0, 0);
-      const rectified = rectifyImage(source, corners);
-      const found = recognizeControls(
-        rectified
-          .getContext("2d")!
-          .getImageData(0, 0, rectified.width, rectified.height),
-      );
-      setHistory((h) => [...h, layout]);
-      if (found.length) {
-        setLayout((l) => ({ ...l, controls: found }));
-        setSelected(found[0].id);
-        notify(
-          `Found ${found.length} controls. Adjust the outlines before playing.`,
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error);
+        if (data.usage) setUsage(data.usage);
+        // Snap each AI outline onto the real pen stroke for precise edges.
+        const img = canvas.getContext("2d")!.getImageData(0, 0, canvas.width, canvas.height);
+        const ink = inkMap(img);
+        const ai: AiShape[] = (Array.isArray(data.shapes) ? data.shapes : []).filter(
+          (sh: AiShape) => Array.isArray(sh?.points) && sh.points.length >= 3 && sh.points.every((p) => Array.isArray(p) && p.every(Number.isFinite)),
         );
-      } else {
-        setLayout((l) => ({ ...l, controls: [] }));
-        notify(
-          "No supported outlines found. Add controls or use the eight-key template.",
-        );
+        // Use the exact outline the pen drew wherever the drawing confirms the AI's shape.
+        const refined = mergeShapes(ai, findRegions(ink, canvas.width, canvas.height));
+        setShapes(refined);
+        found = aiToControls(refined, { useLetters });
+      } catch (e) {
+        // AI is optional: fall back to the offline outline finder.
+        setShapes([]);
+        found = recognizeControls(canvas.getContext("2d")!.getImageData(0, 0, canvas.width, canvas.height));
+        setNotice(`AI scan failed (${e instanceof Error ? e.message : "network"}). Used the offline finder.`);
       }
-      setEditCorners(false);
-      setCalibrated(true);
-    } catch (e) {
-      notify(
-        e instanceof Error
-          ? e.message
-          : "Could not scan this frame. Adjust corners and retry.",
-      );
+      setControls(found);
+      if (!found.length) setNotice("No drawn boxes or circles found. Darken the lines and scan again, or try the demo.");
     } finally {
-      setScanning(false);
+      setBusy("");
     }
   };
-  const bringToLife = async () => {
-    if (stream && !calibrated) {
-      capture();
-      notify("Calibrate the paper before starting camera input.");
-      return;
-    }
-    if (!layout.controls.length) {
-      notify("Add at least one control to your paper.");
-      return;
-    }
-    if (layout.controls.some((c) => !validateControlPolygon(c.polygon))) {
-      notify("Fix crossed or collapsed control corners before playing.");
-      return;
-    }
-    if (overlaps.length) {
-      notify("Separate the highlighted controls before playing.");
-      return;
-    }
-    if (stream && !validateCorners(corners)) {
-      notify("Adjust the four paper corners before playing.");
-      return;
-    }
-    if (!(await prepareAudio())) return;
+  const scanCamera = () => {
+    wakeAudio();
+    const v = video.current;
+    if (!v || v.readyState < 2) return setNotice("Camera is still starting. Try again in a second.");
+    setStill(false);
+    void scan(toCanvas(v));
+  };
+  const scanPhoto = async (file?: File) => {
+    if (!file) return;
+    wakeAudio();
+    setStill(true);
+    const url = URL.createObjectURL(file);
     try {
-      saveLayout(layout);
-      setSaved(layout);
-    } catch {
-      notify("Browser storage is unavailable. Export your layout to keep it.");
-    }
-    stopAll();
-    setCalibrated(!!stream);
-    setInput(stream && trackingState === "ready" ? "vision" : "keyboard");
-    setStage("studio");
-    setSnapshot(null);
-    setSelected(null);
-    setAugmented(true);
-    setRevealing(true);
-    if (revealingTimer.current) clearTimeout(revealingTimer.current);
-    revealingTimer.current = setTimeout(() => setRevealing(false), 1000);
-  };
-  const editLayout = () => {
-    stopAll();
-    setSelected(null);
-    if (stream) {
-      capture();
-      setEditCorners(false);
-    } else {
-      setStage("scan");
-      setEditCorners(false);
-      setSnapshot(null);
-    }
-  };
-  const changeMode = (m: Mode) => {
-    stopAll();
-    setMode(m);
-  };
-  const updateLayout = (next: PaperLayout) => {
-    setHistory((h) => [...h.slice(-29), layout]);
-    setLayout(next);
-  };
-  const changeControl = (id: string, polygon: Point[], commit: boolean) => {
-    if (!undoBase.current) undoBase.current = layout;
-    setLayout((l) => ({
-      ...l,
-      controls: l.controls.map((c) => (c.id === id ? { ...c, polygon } : c)),
-    }));
-    if (commit && undoBase.current) {
-      const base = undoBase.current;
-      setHistory((h) => [...h.slice(-29), base]);
-      undoBase.current = null;
-    }
-  };
-  const addControl = (kind: PaperControl["kind"]) => {
-    if (layout.controls.length >= 32) {
-      notify("This layout supports up to 32 controls.");
-      return;
-    }
-    const id = `${kind}-${Date.now()}`;
-    const x = 0.1 + Math.random() * 0.05,
-      y = 0.07;
-    updateLayout({
-      ...layout,
-      controls: [
-        ...layout.controls,
-        {
-          id,
-          kind,
-          name: kind === "key" ? "C4" : kind === "pad" ? "New pad" : "Level",
-          polygon: [
-            [x, y],
-            [x + 0.15, y],
-            [x + 0.15, y + (kind === "key" ? 0.6 : 0.15)],
-            [x, y + (kind === "key" ? 0.6 : 0.15)],
-          ],
-          action: { type: "note", midi: 60 },
-        },
-      ],
-    });
-    setSelected(id);
-  };
-  const updateSelected = (patch: Partial<PaperControl>) => {
-    if (!selected) return;
-    updateLayout({
-      ...layout,
-      controls: layout.controls.map((c) =>
-        c.id === selected ? { ...c, ...patch } : c,
-      ),
-    });
-  };
-  const testSound = async () => {
-    if (await prepareAudio()) {
-      const c = createDefaultLayout().controls[0];
-      audio.current.trigger(
-        {
-          controlId: "test",
-          phase: "down",
-          source: "pointer",
-          value: 1,
-          timestampMs: performance.now(),
-        },
-        c,
-        "piano",
-        octave,
-      );
-      setTimeout(
-        () =>
-          audio.current.trigger(
-            {
-              controlId: "test",
-              phase: "up",
-              source: "pointer",
-              value: 0,
-              timestampMs: performance.now(),
-            },
-            c,
-            "piano",
-            octave,
-          ),
-        550,
-      );
-    }
-  };
-  const testControl = async () => {
-    if (!selectedControl || !(await prepareAudio())) return;
-    const c = mappedControl(
-      selectedControl,
-      mode,
-      layout.controls.indexOf(selectedControl),
-    );
-    audio.current.trigger(
-      {
-        controlId: "test",
-        phase: "down",
-        source: "pointer",
-        value: 1,
-        timestampMs: performance.now(),
-      },
-      c,
-      mode,
-      octave,
-    );
-    setTimeout(
-      () =>
-        audio.current.trigger(
-          {
-            controlId: "test",
-            phase: "up",
-            source: "pointer",
-            value: 0,
-            timestampMs: performance.now(),
-          },
-          c,
-          mode,
-          octave,
-        ),
-      400,
-    );
-  };
-  const playExample = async () => {
-    if (playing) {
-      stopAll();
-      return;
-    }
-    if (!(await prepareAudio())) return;
-    stopAll();
-    setPlaying(true);
-    const sequence =
-      mode === "piano"
-        ? [0, 2, 4, 7, 6, 4, 2, 1, 0, 2, 4, 5, 4, 2, 1, 0]
-        : [0, 1, 2, 3, 0, 2, 1, 3];
-    const duration = 60000 / bpm / 2;
-    sequence.forEach((key, i) => {
-      const c = layout.controls[key % layout.controls.length];
-      if (!c) return;
-      loopTimers.current.push(
-        setTimeout(() => send(c.id, "down", "loop"), i * duration),
-      );
-      loopTimers.current.push(
-        setTimeout(
-          () => send(c.id, "up", "loop"),
-          i * duration + duration * 0.78,
-        ),
-      );
-    });
-    loopTimers.current.push(
-      setTimeout(() => {
-        setPlaying(false);
-      }, sequence.length * duration),
-    );
-  };
-  const exportLayout = () => {
-    const blob = new Blob([JSON.stringify(layout, null, 2)], {
-      type: "application/json",
-    });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${layout.name.toLowerCase().replace(/[^a-z0-9]+/g, "-") || "paperpilot"}-layout.json`;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  };
-  const importLayout = async (file: File) => {
-    try {
-      if (file.size > 200000) throw new Error("Layout file is too large.");
-      const next = JSON.parse(await file.text());
-      if (!isLayout(next))
-        throw new Error("Choose a valid PaperPilot layout JSON file.");
-      stopAll();
-      updateLayout(next);
-      setStage("scan");
-      setEditCorners(false);
-      setSelected(null);
-      notify("Layout opened. Check the controls before playing.");
+      void scan(toCanvas(await loadImage(url)));
     } catch (e) {
-      notify(e instanceof Error ? e.message : "Could not open layout.");
+      setNotice(e instanceof Error ? e.message : "Could not read that image.");
+    } finally {
+      URL.revokeObjectURL(url);
     }
   };
-  const connectMidi = async () => {
-    if (!(await prepareAudio())) return;
-    try {
-      await midi.current.connect(
-        (note, phase, _velocity, owner) => {
-          const s = current.current;
-          const c = s.layout.controls.find(
-            (c) => c.action.type === "note" && c.action.midi === note,
-          );
-          if (c) send(c.id, phase, "midi", owner);
-        },
-        (connected, label) => {
-          setMidiLabel(label);
-          if (!connected) {
-            audio.current.releaseSource("midi");
-            for (const [id, set] of owners.current) {
-              for (const key of set) {
-                if (key.startsWith("midi")) set.delete(key);
-              }
-              if (!set.size) owners.current.delete(id);
-            }
-            setActive(new Set(owners.current.keys()));
-            setGameActions(new Set());
-          }
-        },
-      );
-      stopAll();
-      setInput("midi");
-      notify("MIDI input selected. Map controller notes to your paper keys.");
-    } catch (e) {
-      notify(e instanceof Error ? e.message : "MIDI could not connect.");
-    }
+  const demo = () => {
+    wakeAudio();
+    setImage(null);
+    setAspect(16 / 10);
+    setStill(true);
+    setControls(demoControls());
+    setStep("play");
   };
-  const fullscreen = () => {
-    const el = stageContainer.current;
-    if (!el) return;
-    if (document.fullscreenElement) void document.exitFullscreen();
-    else
-      void el
-        .requestFullscreen()
-        .catch(() => notify("Fullscreen is unavailable in this browser."));
+
+  // ---- game ------------------------------------------------------------------
+  const startGame = () => {
+    wakeAudio();
+    setGame((s) => ({ ...s, on: true, score: 0, combo: 0, left: GAME_SECONDS, pop: "", target: nextTarget("") }));
   };
-  const resetSession = () => {
-    stopAll();
-    tracker.current.stop();
-    midi.current.disconnect();
-    camera.current.stop();
-    setStream(null);
-    setSnapshot(null);
-    setCalibrated(false);
-    setCameraError("");
-    setStage("setup");
-    setInput("keyboard");
-    setSettings(false);
+  useEffect(() => {
+    if (!game.on) return;
+    const end = performance.now() + game.left * 1000;
+    const t = setInterval(() => {
+      const left = Math.max(0, Math.ceil((end - performance.now()) / 1000));
+      setGame((s) => {
+        if (left > 0) {
+          // Too slow: the light jumps elsewhere and your streak resets.
+          if (performance.now() - targetAt.current > TARGET_MS)
+            return { ...s, left, combo: 0, target: nextTarget(s.target), pop: "too slow" };
+          return s.left === left ? s : { ...s, left };
+        }
+        const best = Math.max(s.best, s.score);
+        try {
+          localStorage.setItem("paperpilot.best", String(best));
+        } catch {
+          /* best score is a nicety */
+        }
+        return { ...s, on: false, left: 0, target: "", best, pop: "" };
+      });
+    }, 100);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- restart only when a round starts/stops
+  }, [game.on, nextTarget]);
+  useEffect(() => {
+    if (!game.pop) return;
+    const t = setTimeout(() => setGame((s) => ({ ...s, pop: "" })), 700);
+    return () => clearTimeout(t);
+  }, [game.pop, game.score]);
+
+  // ---- pointer on the paper ----------------------------------------------------
+  const pointAt = (e: PointerEvent<HTMLDivElement>): Point => {
+    const r = e.currentTarget.getBoundingClientRect();
+    return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height];
   };
-  const cameraSettings = camera.current.getSettings();
-  const status =
-    stage === "setup"
-      ? stream
-        ? "Camera connected"
-        : "Let’s make something"
-      : stage === "scan"
-        ? editCorners
-          ? "Adjust paper corners"
-          : overlaps.length
-            ? "Separate overlapping controls"
-            : "Review your controls"
-        : audioState !== "running"
-          ? "Click to enable sound"
-          : input === "vision"
-            ? diagnostics.handVisible
-              ? "Pinch input ready"
-              : "Show one hand to the camera"
-            : input === "midi"
-              ? midiLabel === "Not connected"
-                ? "Connect MIDI controller"
-                : midiLabel
-              : "Keyboard ready";
-  const goodStatus =
-    stage === "studio" &&
-    audioState === "running" &&
-    (input === "keyboard" ||
-      (input === "vision" && diagnostics.handVisible) ||
-      (input === "midi" && midiLabel !== "Not connected"));
-  return (
-    <div className="app-shell">
-      <header className="topbar">
-        <button
-          className="brand"
-          aria-label="PaperPilot home"
-          onClick={() => {
-            stopAll();
-            setStage("setup");
+  const onPointerDown = (e: PointerEvent<HTMLDivElement>) => {
+    const hit = hitControl(pointAt(e), controls, aspect);
+    if (!hit) return;
+    wakeAudio();
+    press(hit.id, "pointer");
+  };
+
+  const setAction = (id: string, action: ControlAction) => {
+    const next = controls.map((c) => (c.id === id ? { ...c, action, kind: action.type === "note" ? ("key" as const) : ("pad" as const), name: controlName(action) } : c));
+    setControls(next);
+    live.current.controls = next; // so the preview below plays the new sound right away
+    audio.current.warm(next);
+    press(id, "pointer");
+    setTimeout(() => release("pointer"), 400);
+  };
+  /** Switch a shape's instrument, keeping its note name (moved to that instrument's octave). */
+  const setVoice = (c: PaperControl, voice: Voice) => {
+    if (voice === "drums") return setAction(c.id, { type: "sound", sound: DRUMS[0] });
+    if (voice === "fx") return setAction(c.id, { type: "sound", sound: FX[0] });
+    const pc = c.action.type === "note" ? c.action.midi % 12 : 0;
+    setAction(c.id, { type: "note", midi: 12 * (BASE_OCTAVE[voice] + 1) + pc, instrument: voice });
+  };
+  const toggleLetters = (on: boolean) => {
+    setUseLetters(on);
+    if (shapes.length) setControls(aiToControls(shapes, { useLetters: on }));
+  };
+  useEffect(() => audio.current.warm(controls), [controls]);
+
+  const restart = () => {
+    setGame((s) => ({ ...s, on: false, target: "" }));
+    setTab("play");
+    setControls([]);
+    setShapes([]);
+    setImage(null);
+    setStep("scan");
+  };
+
+  // ---- render ------------------------------------------------------------------
+  const scanning = busy === "scan";
+  // Live feed whenever the camera is on, except while the still picture is being labeled.
+  const showVideo = !!stream && !scanning && !still;
+  const paper = (
+    <div
+      className={`paper ${!image && !stream ? "blank" : ""}`}
+      style={{ aspectRatio: aspect, ["--ar" as string]: aspect }}
+      onPointerDown={onPointerDown}
+      onPointerUp={() => release("pointer")}
+      onPointerLeave={() => release("pointer")}
+    >
+      {stream && (
+        <video
+          ref={(v) => {
+            video.current = v;
+            if (v && v.srcObject !== stream) v.srcObject = stream;
           }}
-        >
-          <span className="brand-mark">
-            <svg viewBox="0 0 28 28">
-              <path d="M6 4h11l6 6v14H6zM17 4v7h6M10 15h9M10 19h6" />
-            </svg>
-          </span>
-          <span>
-            Paper<span className="brand-light">Pilot</span>
-          </span>
-          <span className="beta">STUDIO</span>
+          onLoadedMetadata={(e) => step === "scan" && setAspect(e.currentTarget.videoWidth / e.currentTarget.videoHeight)}
+          autoPlay
+          playsInline
+          muted
+          style={{ visibility: showVideo ? "visible" : "hidden" }}
+        />
+      )}
+      {image && !showVideo && <img src={image} alt="Your picture" />}
+      {step === "scan" && !stream && (
+        <div className="empty">
+          <Camera size={28} />
+          <p>{busy === "camera" ? "Starting camera…" : "Allow the camera, or use a photo."}</p>
+        </div>
+      )}
+      {step === "play" && (
+        <svg viewBox="0 0 1 1" preserveAspectRatio="none">
+          {controls.map((c) => (
+            <polygon
+              key={c.id}
+              points={c.polygon.map((p) => p.join(",")).join(" ")}
+              className={[`v-${voiceOf(c)}`, active.has(c.id) && "on", game.target === c.id && "target", hover.has(c.id) && "hover"]
+                .filter(Boolean)
+                .join(" ")}
+              vectorEffect="non-scaling-stroke"
+            />
+          ))}
+        </svg>
+      )}
+      {step === "play" &&
+        controls.map((c, i) => {
+          const [x, y] = center(c.polygon);
+          return (
+            <span
+              key={c.id}
+              className={`tag v-${voiceOf(c)} ${active.has(c.id) ? "on" : ""}`}
+              style={{ left: `${x * 100}%`, top: `${y * 100}%` }}
+            >
+              {label(c.action)}
+              {KEYS[i] && <kbd>{KEYS[i].toUpperCase()}</kbd>}
+            </span>
+          );
+        })}
+      {tips.map((t, i) => (
+        <i key={i} className="tip" style={{ left: `${t[0] * 100}%`, top: `${t[1] * 100}%` }} />
+      ))}
+      {scanning && (
+        <div className="scanning">
+          <LoaderCircle className="spin" size={22} /> Labeling your drawing…
+        </div>
+      )}
+      {game.pop && <b className={`pop ${game.pop === "miss" || game.pop === "too slow" ? "bad" : ""}`}>{game.pop}</b>}
+    </div>
+  );
+
+  const usageText = usage
+    ? usage.ai === false
+      ? "Gemini off · add GEMINI_API_KEY"
+      : `Gemini · ${usage.scans} scan${usage.scans === 1 ? "" : "s"} · $${usage.costUsd.toFixed(4)} of $${usage.budgetUsd.toFixed(2)}`
+    : "Gemini · usage unavailable";
+
+  return (
+    <div className="app">
+      <header>
+        <button className="brand" onClick={restart} aria-label="Start over">
+          PaperPilot
         </button>
-        <nav className="workflow" aria-label="Workflow">
-          <button
-            className={stage === "setup" ? "current" : ""}
-            onClick={() => {
-              stopAll();
-              setStage("setup");
-            }}
-          >
-            <span>{stage === "setup" ? "01" : <Check size={12} />}</span>Setup
-          </button>
-          <ChevronRight size={12} />
-          <button
-            className={stage === "scan" ? "current" : ""}
-            onClick={editLayout}
-          >
-            <span>02</span>Scan & map
-          </button>
-          <ChevronRight size={12} />
-          <button
-            className={stage === "studio" ? "current" : ""}
-            onClick={() => void bringToLife()}
-          >
-            <span>03</span>Studio
-          </button>
-        </nav>
-        <div className="top-right">
-          <span className="local-label">
-            <span />
-            All local. All yours.
-          </span>
-          <IconButton label="Help and shortcuts" onClick={() => setHelp(true)}>
-            <CircleHelp size={18} />
-          </IconButton>
-          <IconButton
-            label="Session settings"
-            onClick={() => setSettings(true)}
-          >
-            <Settings2 size={18} />
-          </IconButton>
+        {step === "play" && !scanning && controls.length > 0 && (
+          <nav className="tabs">
+            {(["play", "game"] as const).map((t) => (
+              <button
+                key={t}
+                className={tab === t ? "on" : ""}
+                onClick={() => {
+                  setGame((s) => ({ ...s, on: false, target: "" }));
+                  setTab(t);
+                }}
+              >
+                {t === "play" ? <Music size={16} /> : <Trophy size={16} />} {t === "play" ? "Play" : "Game"}
+              </button>
+            ))}
+          </nav>
+        )}
+        <div
+          className="usage"
+          title={usage ? `${usage.inTokens.toLocaleString()} input + ${usage.outTokens.toLocaleString()} output tokens. Estimate from list price; check AI Studio billing for the exact charge.` : ""}
+        >
+          <span className="meter" style={{ width: `${usage ? Math.min(100, (usage.costUsd / usage.budgetUsd) * 100) : 0}%` }} />
+          {usageText}
         </div>
       </header>
-      <div className="app-body">
-        <aside className="app-rail">
-          <div className="rail-label">CREATE</div>
-          {MODES.map((m) => (
-            <button
-              key={m.id}
-              className={`rail-item ${mode === m.id ? "selected" : ""}`}
-              aria-label={`${m.name} mode`}
-              aria-pressed={mode === m.id}
-              onClick={() => changeMode(m.id)}
-            >
-              <m.icon size={22} strokeWidth={1.5} />
-              <span>{m.name}</span>
-            </button>
-          ))}
-          <div className="rail-bottom">
-            <IconButton
-              label="Open layout file"
-              onClick={() => fileInput.current?.click()}
-            >
-              <FolderOpen size={20} />
-            </IconButton>
-            <IconButton label="Diagnostics" onClick={() => setSettings(true)}>
-              <Activity size={19} />
-            </IconButton>
-            <div className="rail-version">v0.1</div>
-          </div>
-        </aside>
-        <main className="workspace" ref={stageContainer}>
-          <div className="workspace-heading">
-            <div>
-              <div className="eyebrow">
-                {stage === "setup"
-                  ? "FROM PAPER TO POSSIBILITY"
-                  : stage === "scan"
-                    ? "MAKE IT YOURS"
-                    : "YOUR CREATIVE SPACE"}
-                <span className="eyebrow-line" />
-              </div>
-              <h1>
-                {stage === "setup"
-                  ? "An instrument, in your own hands"
-                  : stage === "scan"
-                    ? "A sketch. A few adjustments. Magic"
-                    : layout.name}
-                <span className="heading-dot">.</span>
-              </h1>
-              <p>
-                {stage === "setup"
-                  ? "Draw it. Scan it. Bring it to life."
-                  : stage === "scan"
-                    ? "Every line is yours. Let’s make sure every note is, too."
-                    : modeInfo.description}
-              </p>
-            </div>
-            <div className="workspace-actions">
-              {stage === "studio" && (
-                <button className="button subtle" onClick={editLayout}>
-                  <ScanLine size={15} />
-                  Edit layout
-                </button>
-              )}
-              <IconButton
-                label={inspector ? "Hide inspector" : "Show inspector"}
-                onClick={() => setInspector(!inspector)}
-              >
-                {inspector ? (
-                  <PanelRightClose size={19} />
-                ) : (
-                  <PanelRightOpen size={19} />
-                )}
-              </IconButton>
-            </div>
-          </div>
-          <div className="stage-toolbar">
-            <button
-              onClick={() => {
-                if (stage === "studio" && audioState !== "running")
-                  void prepareAudio();
-              }}
-              className={`status-label ${goodStatus ? "is-ready" : ""}`}
-            >
-              <span />
-              {status}
-            </button>
-            <div className="segmented">
-              <button
-                className={!augmented ? "selected" : ""}
-                onClick={() => setAugmented(false)}
-              >
-                <Camera size={14} />
-                {stream ? "Camera" : "Paper"}
+
+      <main>
+        <section className="stage">{paper}</section>
+
+        <aside>
+          {step === "scan" && (
+            <>
+              <h1>Take a picture of your drawing</h1>
+              <p className="lead">Each shape you draw is an instrument. Write a note (C, F#, Bb) inside a shape to pick its exact note.</p>
+              <ul className="legend">
+                {(Object.keys(SHAPE_VOICE) as AiShape["shape"][]).map((sh) => (
+                  <li key={sh} className={`v-${SHAPE_VOICE[sh]}`}>
+                    <b>{SHAPE_GLYPH[sh]}</b> {sh === "other" ? "other shape" : sh} <span>{VOICE_NAME[SHAPE_VOICE[sh]]}</span>
+                  </li>
+                ))}
+              </ul>
+              <button className="primary big" onClick={stream ? scanCamera : startCamera} disabled={busy === "camera"}>
+                <Camera size={20} /> {stream ? "Take picture" : busy === "camera" ? "Starting camera…" : "Turn on camera"}
               </button>
-              <button
-                className={augmented ? "selected" : ""}
-                onClick={() => setAugmented(true)}
-              >
-                <Sparkles size={14} />
-                Augmented
+              <button onClick={() => fileInput.current?.click()}>
+                <ImageUp size={18} /> Use a photo instead
               </button>
-            </div>
-          </div>
-          {stage === "scan" && !editCorners && (
-            <div className="editor-toolbar">
-              <span>
-                <SquareMousePointer size={15} />
-                Select & drag
-              </span>
-              <div className="tool-separator" />
-              <button onClick={() => addControl("key")}>
-                <Plus size={14} />
-                Key
+              <button className="ghost" onClick={demo}>
+                <Play size={18} /> Try without paper
               </button>
-              <button onClick={() => addControl("pad")}>
-                <Plus size={14} />
-                Pad
-              </button>
-              <button
-                disabled={!selected}
-                onClick={() => {
-                  updateLayout({
-                    ...layout,
-                    controls: layout.controls.filter((c) => c.id !== selected),
-                  });
-                  setSelected(null);
-                }}
-                aria-label="Delete selected control"
-              >
-                <Trash2 size={15} />
-              </button>
-              <button
-                disabled={!history.length}
-                onClick={() => {
-                  setLayout(history[history.length - 1]);
-                  setHistory((h) => h.slice(0, -1));
-                }}
-                aria-label="Undo layout change"
-              >
-                <Undo2 size={15} />
-              </button>
-              {stream && (
-                <button
-                  onClick={() => {
-                    capture();
-                  }}
-                  aria-label="Rescan and recalibrate"
-                >
-                  <ScanLine size={14} />
-                </button>
-              )}
-              <button
-                className="template-button"
-                onClick={() => {
-                  updateLayout({
-                    ...layout,
-                    controls: createDefaultLayout().controls,
-                  });
-                  setSelected(null);
-                }}
-              >
-                <Piano size={14} />
-                8-key template
-              </button>
-            </div>
+              <input ref={fileInput} type="file" accept="image/*" hidden onChange={(e) => void scanPhoto(e.target.files?.[0])} />
+            </>
           )}
-          <div className="stage-content">
-            <PaperStage
-              layout={layout}
-              mode={stage === "scan" ? "piano" : mode}
-              stage={stage}
-              stream={stream}
-              snapshot={snapshot}
-              corners={corners}
-              setCorners={setCorners}
-              active={active}
-              augmented={augmented}
-              intensity={intensity}
-              selected={selected}
-              setSelected={setSelected}
-              editCorners={editCorners}
-              onChangeControl={changeControl}
-              onPress={(id) => send(id, "down")}
-              onRelease={(id) => send(id, "up")}
-              onVideo={setVideo}
-              tip={input === "vision" ? tip : null}
-              revealing={revealing}
-              octave={octave}
-              fullscreen={fullscreen}
-              cameraReady={!!stream}
-            />
-            {stage === "studio" && mode === "game" && (
-              <MiniGame actions={gameActions} onReset={stopAll} />
-            )}
-          </div>
-          {stage === "setup" ? (
-            <div className="setup-callout">
-              <div className="callout-icon">
-                <Camera size={23} strokeWidth={1.5} />
-              </div>
-              <div className="callout-copy">
-                <h3>
-                  {stream
-                    ? "Your camera is ready. So is your canvas."
-                    : "Your next instrument starts with a sketch."}
-                </h3>
-                <p>
-                  {stream
-                    ? "Lay your paper flat and lift your hands for a clean scan."
-                    : "Connect a camera and place your drawing in view. We’ll take it from there."}
-                </p>
-              </div>
-              <button
-                className="button primary"
-                disabled={cameraBusy}
-                onClick={() => (stream ? capture() : void startCamera())}
-              >
-                {cameraBusy ? (
-                  <LoaderCircle className="spinning" size={16} />
-                ) : stream ? (
-                  <ScanLine size={16} />
-                ) : (
-                  <Camera size={16} />
-                )}{" "}
-                {cameraBusy
-                  ? "Starting camera"
-                  : stream
-                    ? "Scan paper"
-                    : "Start camera"}
-                <ArrowRight size={16} />
-              </button>
-            </div>
-          ) : stage === "scan" ? (
-            <div className="setup-callout scan-callout">
-              <div className="callout-icon">
-                <ScanLine size={22} />
-              </div>
-              <div className="callout-copy">
-                <h3>
-                  {editCorners
-                    ? "Give your page four corners."
-                    : `${layout.controls.length} controls. Ready for their first notes.`}
-                </h3>
-                <p>
-                  {editCorners
-                    ? "Drag 1–4 clockwise: top left, top right, bottom right, bottom left."
-                    : overlaps.length
-                      ? "Controls overlap. Move or resize them to separate their playing areas."
-                      : "Select a control to change its note. Drag its corners to fit your sketch."}
-                </p>
-              </div>
-              {editCorners ? (
-                <button
-                  className="button primary"
-                  onClick={() => void scan()}
-                  disabled={scanning}
-                >
-                  {scanning ? (
-                    <LoaderCircle className="spinning" size={16} />
-                  ) : (
-                    <ScanLine size={16} />
-                  )}{" "}
-                  {scanning ? "Reading outlines" : "Detect controls"}
-                </button>
+
+          {step === "play" && scanning && (
+            <>
+              <h2>Labeling…</h2>
+              <p className="lead">Gemini is finding your keys and drums. Keep the paper and camera still.</p>
+            </>
+          )}
+
+          {step === "play" && !scanning && tab === "game" && (
+            <>
+              <h2>Catch the light</h2>
+              {game.on ? (
+                <div className="scoreboard">
+                  <div><small>Score</small><b>{game.score}</b></div>
+                  <div><small>Streak</small><b>×{game.combo}</b></div>
+                  <div><small>Time</small><b>{game.left}s</b></div>
+                </div>
               ) : (
-                <button
-                  className="button primary"
-                  onClick={() => void bringToLife()}
-                  disabled={!layout.controls.length || !!overlaps.length}
-                >
-                  <Sparkles size={16} />
-                  Bring it to life
-                  <ArrowRight size={16} />
-                </button>
+                <>
+                  <p className="lead">A shape glows. Hit it before it jumps away. Streaks and fast hits score more. {GAME_SECONDS} seconds.</p>
+                  <div className="scoreboard two">
+                    <div><small>Best</small><b>{game.best}</b></div>
+                    <div><small>Last round</small><b>{game.score}</b></div>
+                  </div>
+                  <button className="primary big" onClick={startGame} disabled={controls.length < 2}>
+                    <Play size={20} /> Start
+                  </button>
+                </>
               )}
-            </div>
-          ) : (
-            <div className="playing-hint">
-              <div>
-                <Keyboard size={17} />
-                <span>Make a little music.</span>
-                <div className="keycaps">
-                  {KEY_BINDINGS.slice(
-                    0,
-                    Math.min(8, layout.controls.length),
-                  ).map((k, i) => (
-                    <kbd
-                      key={k}
-                      className={
-                        active.has(layout.controls[i]?.id) ? "pressed" : ""
-                      }
-                    >
-                      {k.toUpperCase()}
-                    </kbd>
+              {showVideo && (
+                <div className="fingers" role="radiogroup" aria-label="Fingers that play">
+                  <span>Fingers</span>
+                  {([1, 2, 10] as const).map((n) => (
+                    <button key={n} role="radio" aria-checked={fingers === n} className={fingers === n ? "on" : ""} onClick={() => setFingers(n)}>
+                      {n}
+                    </button>
                   ))}
                 </div>
-                <span className="muted">or click a key</span>
-              </div>
-              {mode !== "game" && (
-                <button onClick={() => void playExample()}>
-                  <Play size={13} />
-                  {playing ? "Stop example" : "Hear an example"}
-                </button>
               )}
-            </div>
+            </>
           )}
-          {soundReady && audio.current.getDiagnostics().assetError && (
-            <div className="inline-error" role="alert">
-              {audio.current.getDiagnostics().preset} ·{" "}
-              {audio.current.getDiagnostics().assetError}
-            </div>
-          )}
-          {cameraError && (
-            <div className="inline-error" role="alert">
-              <Camera size={15} />
-              {cameraError}
-              <button onClick={() => void startCamera()}>Retry</button>
-            </div>
-          )}
-          {stage === "setup" && (
-            <div className="under-stage">
-              <button onClick={() => void demo()}>
-                <Play size={12} />
-                Just exploring? Try the demo layout
-                <ArrowRight size={13} />
-              </button>
-              <span>
-                <Headphones size={13} />
-                Best with wired audio
-              </span>
-            </div>
-          )}
-        </main>
-        {inspector && (
-          <aside className="inspector">
-            <div className="inspector-title">
-              <span>
-                {stage === "scan" && selectedControl
-                  ? "CONTROL DETAILS"
-                  : "THE FINER THINGS"}
-              </span>
-              <SlidersHorizontal size={15} />
-            </div>
-            {stage === "scan" && selectedControl ? (
-              <>
-                <div className="inspector-section">
-                  <div className="section-heading">
-                    <h2>{selectedControl.name}</h2>
-                    <span className="small-tag">{selectedControl.kind}</span>
-                  </div>
-                  <label className="field-label">
-                    Name
-                    <input
-                      value={selectedControl.name}
-                      onChange={(e) => updateSelected({ name: e.target.value })}
-                    />
-                  </label>
-                  <label className="field-label">
-                    Assigned note
-                    <select
-                      value={
-                        selectedControl.action.type === "note"
-                          ? selectedControl.action.midi
-                          : 60
-                      }
-                      onChange={(e) =>
-                        updateSelected({
-                          action: { type: "note", midi: +e.target.value },
-                        })
-                      }
-                    >
-                      {Array.from({ length: 37 }, (_, i) => i + 48).map((n) => (
-                        <option value={n} key={n}>
-                          {noteName(n)}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="field-label">
-                    Control type
-                    <select
-                      value={selectedControl.kind}
-                      onChange={(e) =>
-                        updateSelected({
-                          kind: e.target.value as PaperControl["kind"],
-                        })
-                      }
-                    >
-                      <option value="key">Piano key</option>
-                      <option value="pad">Pad</option>
-                    </select>
-                  </label>
-                  <button
-                    className="button full-width"
-                    onClick={() => void testControl()}
-                  >
-                    <Volume2 size={15} />
-                    Test control
-                  </button>
-                  <button
-                    className="button subtle full-width"
-                    onClick={() => {
-                      const id = `copy-${Date.now()}`;
-                      updateLayout({
-                        ...layout,
-                        controls: [
-                          ...layout.controls,
-                          {
-                            ...selectedControl,
-                            id,
-                            polygon: selectedControl.polygon.map(
-                              (q) =>
-                                [
-                                  Math.min(0.99, q[0] + 0.03),
-                                  Math.min(0.99, q[1] + 0.03),
-                                ] as Point,
-                            ),
-                          },
-                        ],
-                      });
-                      setSelected(id);
-                    }}
-                  >
-                    <Copy size={14} />
-                    Duplicate
-                  </button>
-                </div>
-                {overlaps.includes(selectedControl.id) && (
-                  <p className="inspector-warning">
-                    This control overlaps another. Move or resize it before
-                    playing.
-                  </p>
-                )}
-              </>
-            ) : (
-              <>
-                <div className="inspector-section instrument-section">
-                  <div className="section-heading">
-                    <h2>Instrument</h2>
-                    <span className="small-tag">
-                      {mode === "piano"
-                        ? "01 / 05"
-                        : `${String(MODES.findIndex((m) => m.id === mode) + 1).padStart(2, "0")} / 05`}
-                    </span>
-                  </div>
-                  <div className={`preset-art ${mode}`}>
-                    <div className="art-orbit" />
-                    <div className="art-keys">
-                      <i />
-                      <i />
-                      <i />
-                      <i />
-                      <i />
-                      <i />
-                      <i />
-                      <i />
-                    </div>
-                    <span>
-                      {mode === "piano"
-                        ? "THE ORIGINAL COLLECTION"
-                        : mode.toUpperCase() + " COLLECTION"}
-                    </span>
-                    <span className="art-number">
-                      {String(
-                        MODES.findIndex((m) => m.id === mode) + 1,
-                      ).padStart(2, "0")}
-                    </span>
-                  </div>
-                  <label className="preset-select">
-                    <select
-                      aria-label="Sound preset"
-                      value={preset}
-                      onChange={(e) =>
-                        setPreset(e.target.value as typeof preset)
-                      }
-                    >
-                      <option value="piano">Studio Grand</option>
-                      <option value="felt">Soft Felt</option>
-                      <option value="synth">Analog Light</option>
-                    </select>
-                    <ChevronDown size={15} />
-                  </label>
-                  <p className="preset-description">
-                    {mode === "piano"
-                      ? preset === "piano"
-                        ? "Warm, detailed, and beautifully familiar."
-                        : preset === "felt"
-                          ? "A softer touch for quiet discoveries."
-                          : "A warm waveform, made for wandering."
-                      : mode === "chords"
-                        ? "C · Am · F · G. Four chords, endless songs."
-                        : mode === "drums"
-                          ? "Kick, snare, hi-hat, and a little clap."
-                          : mode === "soundboard"
-                            ? "Four original sounds. A world of textures."
-                            : "Jump, dodge, and make the page your own."}
-                  </p>
-                </div>
-                <div className="inspector-section sound-section">
-                  <div className="section-heading">
-                    <h2>Sound</h2>
-                    <Waves size={15} />
-                  </div>
-                  <div className="control-row">
-                    <label htmlFor="octave">Octave</label>
-                    <div className="stepper">
-                      <button
-                        aria-label="Lower octave"
-                        disabled={octave <= -2}
-                        onClick={() => {
-                          stopAll();
-                          setOctave((o) => o - 1);
-                        }}
-                      >
-                        −
-                      </button>
-                      <output id="octave">
-                        {octave > 0 ? "+" : ""}
-                        {octave}
-                      </output>
-                      <button
-                        aria-label="Higher octave"
-                        disabled={octave >= 2}
-                        onClick={() => {
-                          stopAll();
-                          setOctave((o) => o + 1);
-                        }}
-                      >
-                        +
-                      </button>
-                    </div>
-                  </div>
-                  <Range
-                    label="Release"
-                    value={release}
-                    min={0.1}
-                    max={1.5}
-                    step={0.05}
-                    onChange={setRelease}
-                    display={`${release.toFixed(2)} s`}
-                  />
-                  <Range
-                    label="Space"
-                    value={effect}
-                    onChange={setEffect}
-                    display={`${Math.round(effect * 100)}%`}
-                  />
-                  <div className="control-row">
-                    <label>Sustain</label>
-                    <Toggle
-                      label="Sustain pedal"
-                      checked={sustain}
-                      onChange={() => setSustain(!sustain)}
-                    />
-                  </div>
-                </div>
-              </>
-            )}
-            <div className="inspector-section">
-              <div className="section-heading">
-                <h2>Appearance</h2>
-                <Sparkles size={14} />
-              </div>
-              <div className="skin-options">
-                {(
-                  [
-                    { id: "obsidian-ivory", name: "Ivory" },
-                    { id: "smoked-glass", name: "Glass" },
-                    { id: "midnight-circuit", name: "Midnight" },
-                  ] as { id: Skin; name: string }[]
-                ).map((s) => (
-                  <button
-                    aria-label={`${s.name} skin`}
-                    aria-pressed={layout.skin === s.id}
-                    className={`skin-option ${s.id} ${layout.skin === s.id ? "selected" : ""}`}
-                    key={s.id}
-                    onClick={() => setLayout((l) => ({ ...l, skin: s.id }))}
-                  >
-                    <span className="skin-swatch">
-                      <i />
-                      <i />
-                      <i />
-                      {layout.skin === s.id && <Check size={11} />}
-                    </span>
-                    <span>{s.name}</span>
-                  </button>
-                ))}
-              </div>
-              <Range
-                label="AR intensity"
-                value={intensity}
-                min={0.2}
-                max={1}
-                onChange={setIntensity}
-                display={`${Math.round(intensity * 100)}%`}
-              />
-            </div>
-            <div className="inspector-section session-section">
-              <div className="section-heading">
-                <h2>
-                  {stage === "setup" ? "Let’s get connected" : "Input & layout"}
-                </h2>
-                <button
-                  className="text-icon"
-                  aria-label="Input settings"
-                  onClick={() => setSettings(true)}
-                >
-                  <Settings2 size={14} />
-                </button>
-              </div>
-              {stage === "setup" ? (
-                <>
-                  <label className="camera-select">
-                    <Camera size={15} />
-                    <select
-                      aria-label="Camera"
-                      value={deviceId}
-                      onChange={(e) => {
-                        setDeviceId(e.target.value);
-                        if (stream) void startCamera(e.target.value);
-                      }}
-                    >
-                      <option value="">Default camera</option>
-                      {devices.map((d, i) => (
-                        <option key={d.deviceId || i} value={d.deviceId}>
-                          {d.label || `Camera ${i + 1}`}
-                        </option>
-                      ))}
-                    </select>
-                    <ChevronDown size={13} />
-                  </label>
-                  <div className="readiness">
-                    <span>
-                      <i className={stream ? "ready" : ""} />
-                      Camera
-                    </span>
-                    <span>
-                      <i
-                        className={
-                          trackingState === "ready"
-                            ? "ready"
-                            : trackingState === "loading"
-                              ? "loading"
-                              : ""
-                        }
-                      />
-                      Tracking
-                    </span>
-                    <span>
-                      <i
-                        className={
-                          soundReady ? "ready" : soundBusy ? "loading" : ""
-                        }
-                      />
-                      Sounds
-                    </span>
-                  </div>
-                  <button
-                    className="button subtle full-width"
-                    onClick={() => void testSound()}
-                    disabled={soundBusy}
-                  >
-                    {soundBusy ? (
-                      <LoaderCircle size={14} className="spinning" />
-                    ) : (
-                      <Volume2 size={14} />
-                    )}
-                    Test sound
-                  </button>
-                </>
-              ) : (
-                <>
-                  <label className="field-label">
-                    Playing with
-                    <select
-                      aria-label="Input source"
-                      value={input}
-                      onChange={(e) => {
-                        stopAll();
-                        setInput(e.target.value as typeof input);
-                      }}
-                    >
-                      <option value="keyboard">Keyboard & mouse</option>
-                      <option
-                        value="vision"
-                        disabled={
-                          !stream || trackingState !== "ready" || !calibrated
-                        }
-                      >
-                        Camera · pinch gesture
-                      </option>
-                      <option
-                        value="midi"
-                        disabled={midiLabel === "Not connected"}
-                      >
-                        MIDI controller
-                      </option>
-                    </select>
-                  </label>
-                  {input === "vision" && (
-                    <p className="input-note">
-                      Point at a key. Pinch to play; open to release. One hand,
-                      one note.
-                    </p>
-                  )}
-                  <button
-                    className="button subtle full-width"
-                    onClick={() => {
-                      try {
-                        if (!isLayout(layout) || overlaps.length) {
-                          notify("Fix the layout geometry before saving.");
-                          return;
-                        }
-                        saveLayout(layout);
-                        setSaved(layout);
-                        notify("Layout saved on this browser.");
-                      } catch {
-                        notify(
-                          "Storage unavailable. Export the layout instead.",
-                        );
-                      }
-                    }}
-                  >
-                    <Save size={14} />
-                    Save layout
-                  </button>
-                </>
-              )}
-              {saved && stage === "setup" && (
-                <button
-                  className="saved-layout"
-                  onClick={() => void demo(saved)}
-                >
-                  <FolderOpen size={14} />
-                  <span>
-                    Open saved layout<small>{saved.name}</small>
-                  </span>
-                  <ChevronRight size={14} />
-                </button>
-              )}
-            </div>
-            <div className="inspector-footer">
-              <span className="privacy-mark">
-                <Hand size={15} />
-              </span>
-              <p>
-                Your camera stays here.
-                <br />
-                <strong>Nothing leaves your device.</strong>
+
+          {step === "play" && !scanning && tab === "play" && (
+            <>
+              <h2>{controls.length ? "Play" : "No shapes found"}</h2>
+              <p className="lead">
+                {!controls.length
+                  ? "Darken the lines and retake the picture."
+                  : showVideo
+                    ? "Tap a shape on your paper, or click it on screen. Yellow dots are your fingertips."
+                    : "Click a shape or use the keys shown."}
               </p>
-            </div>
-          </aside>
-        )}
-      </div>
-      <footer className="transport">
-        <div className="transport-brand">
-          <span className="transport-light" />
-          <span>
-            {stage === "studio" ? "STUDIO SESSION" : "A NEW POSSIBILITY"}
-            <small>{layout.name}</small>
-          </span>
-        </div>
-        <div className="transport-main">
-          <button
-            className={`play-button ${playing ? "playing" : ""}`}
-            aria-label={playing ? "Stop example" : "Play example melody"}
-            disabled={stage !== "studio" || mode === "game"}
-            onClick={() => void playExample()}
-          >
-            {playing ? (
-              <Square size={16} fill="currentColor" />
-            ) : (
-              <Play size={17} fill="currentColor" />
-            )}
-          </button>
-          <div className="transport-divider" />
-          <label className="bpm-control">
-            <input
-              aria-label="Tempo"
-              type="number"
-              min={40}
-              max={240}
-              value={bpm}
-              onChange={(e) =>
-                setBpm(Math.max(40, Math.min(240, +e.target.value || 100)))
-              }
-            />
-            <span>BPM</span>
-          </label>
-          <button
-            className={`metronome-button ${metronome ? "active" : ""}`}
-            aria-label="Toggle metronome"
-            aria-pressed={metronome}
-            disabled={!soundReady}
-            onClick={() => setMetronome(!metronome)}
-          >
-            <svg width="20" height="23" viewBox="0 0 20 23">
-              <path
-                d="M7 3h6l5 18H2zM10 16l5-12M7 18h6"
-                stroke="currentColor"
-                fill="none"
-                strokeWidth="1.5"
-              />
-            </svg>
-          </button>
-          <div className="beat-dots">
-            {[0, 1, 2, 3].map((n) => (
-              <i key={n} className={metronome && beat === n ? "on" : ""} />
-            ))}
-          </div>
-          <div className="transport-divider" />
-          <span className="transport-instrument">
-            <Piano size={17} />
-            {mode === "piano"
-              ? preset === "piano"
-                ? "Studio Grand"
-                : preset === "felt"
-                  ? "Soft Felt"
-                  : "Analog Light"
-              : modeInfo.name}
-          </span>
-        </div>
-        <div className="transport-output">
-          <Volume2 size={17} />
-          <input
-            aria-label="Master volume"
-            type="range"
-            min="0"
-            max="1"
-            step=".01"
-            value={volume}
-            onChange={(e) => setVolume(+e.target.value)}
-          />
-          <div
-            className="level-meter"
-            aria-label={`Audio level ${Math.round(level * 100)} percent`}
-          >
-            {Array.from({ length: 12 }, (_, i) => (
-              <i key={i} className={level * 36 > i ? "lit" : ""} />
-            ))}
-          </div>
-          <button className="stop-all" onClick={stopAll}>
-            <Square size={12} />
-            Stop all
-          </button>
-        </div>
-      </footer>
-      <input
-        ref={fileInput}
-        type="file"
-        accept="application/json,.json"
-        hidden
-        onChange={(e) => {
-          const f = e.target.files?.[0];
-          if (f) void importLayout(f);
-          e.target.value = "";
-        }}
-      />
-      {notice && (
-        <div className="toast" role="status">
-          <span>{notice}</span>
-          <button
-            aria-label="Dismiss notification"
-            onClick={() => setNotice("")}
-          >
-            <X size={15} />
-          </button>
-        </div>
-      )}
-      {revealing && (
-        <button className="skip-reveal" onClick={() => setRevealing(false)}>
-          Skip reveal
-          <ArrowRight size={13} />
-        </button>
-      )}
-      {(settings || help) && (
-        <div
-          className="modal-backdrop"
-          onClick={() => {
-            setSettings(false);
-            setHelp(false);
-          }}
-        >
-          <section
-            className="modal"
-            role="dialog"
-            aria-modal="true"
-            aria-label={help ? "A quick field guide" : "Session settings"}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="modal-heading">
-              <div>
-                <div className="eyebrow">PAPERPILOT STUDIO</div>
-                <h2>
-                  {help ? "A quick field guide." : "Make yourself at home."}
-                </h2>
-              </div>
-              <IconButton
-                label="Close dialog"
-                onClick={() => {
-                  setSettings(false);
-                  setHelp(false);
-                }}
-              >
-                <X size={20} />
-              </IconButton>
-            </div>
-            {help ? (
-              <>
-                <div className="guide-step">
-                  <span>01</span>
-                  <div>
-                    <h3>A pen. A page. Your imagination.</h3>
-                    <p>
-                      Draw eight separate rectangles with a thick black marker.
-                      Leave small gaps between keys. Tape the page flat under an
-                      overhead camera.
-                    </p>
-                  </div>
+              {showVideo && !trackerReady && <p className="hint">Loading hand tracking…</p>}
+              {showVideo && (
+                <div className="fingers" role="radiogroup" aria-label="Fingers that play">
+                  <span>Fingers</span>
+                  {([1, 2, 10] as const).map((n) => (
+                    <button key={n} role="radio" aria-checked={fingers === n} className={fingers === n ? "on" : ""} onClick={() => setFingers(n)}>
+                      {n}
+                    </button>
+                  ))}
                 </div>
-                <div className="guide-step">
-                  <span>02</span>
-                  <div>
-                    <h3>Find the shape of your sound.</h3>
-                    <p>
-                      Start the camera, scan the paper, and drag the four
-                      corners into place. Review detected controls, or add and
-                      resize them by hand.
-                    </p>
-                  </div>
-                </div>
-                <div className="guide-step">
-                  <span>03</span>
-                  <div>
-                    <h3>Bring a little possibility to life.</h3>
-                    <p>
-                      In camera mode, point your index finger at a key and pinch
-                      your thumb to play. Open your hand to rearm. This is
-                      gesture input, not physical touch detection.
-                    </p>
-                  </div>
-                </div>
-                <div className="shortcut-guide">
-                  <Keyboard size={18} />
-                  <div>
-                    <strong>A S D F G H J K</strong>
-                    <p>Play the first eight controls · Esc stops all sounds.</p>
-                  </div>
-                </div>
-                <p className="modal-note">
-                  For the clearest view, use bright diffuse light and an
-                  overhead camera. Live AR uses a translucent outline so your
-                  hands stay visible. Tape the page in place; recalibrate after
-                  moving it.
-                </p>
-              </>
-            ) : (
-              <>
-                <div className="settings-grid">
-                  <label className="field-label">
-                    Layout name
-                    <input
-                      value={layout.name}
-                      maxLength={80}
-                      onChange={(e) =>
-                        setLayout((l) => ({ ...l, name: e.target.value }))
-                      }
-                    />
-                  </label>
-                  <label className="field-label">
-                    Camera
-                    <select
-                      value={deviceId}
-                      onChange={(e) => setDeviceId(e.target.value)}
-                    >
-                      <option value="">Default camera</option>
-                      {devices.map((d, i) => (
-                        <option key={d.deviceId || i} value={d.deviceId}>
-                          {d.label || `Camera ${i + 1}`}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                </div>
-                <div className="modal-buttons">
-                  <button
-                    className="button"
-                    onClick={() => void startCamera()}
-                    disabled={cameraBusy}
-                  >
-                    <Camera size={15} />
-                    {stream ? "Reconnect camera" : "Connect camera"}
-                  </button>
-                  <button className="button" onClick={() => void connectMidi()}>
-                    <Piano size={15} />
-                    Connect MIDI
-                  </button>
-                  <button className="button" onClick={exportLayout}>
-                    <ArrowDownToLine size={15} />
-                    Export layout
-                  </button>
-                  <button
-                    className="button"
-                    onClick={() => fileInput.current?.click()}
-                  >
-                    <FolderOpen size={15} />
-                    Import layout
-                  </button>
-                </div>
-                <details className="diagnostics">
-                  <summary>
-                    <Activity size={15} /> Under the hood{" "}
-                    <ChevronDown size={14} />
-                  </summary>
-                  <dl>
-                    <div>
-                      <dt>Camera settings</dt>
-                      <dd>
-                        {stream
-                          ? `${cameraSettings.width} × ${cameraSettings.height} · ${cameraSettings.frameRate?.toFixed(0) || "—"} fps`
-                          : "Not connected"}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt>Fresh camera / inference FPS</dt>
-                      <dd>
-                        {diagnostics.cameraFps.toFixed(1)} /{" "}
-                        {diagnostics.fps.toFixed(1)}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt>Latest inference</dt>
-                      <dd>{diagnostics.inferenceMs.toFixed(1)} ms</dd>
-                    </div>
-                    <div>
-                      <dt>Tracking / lost count</dt>
-                      <dd>
-                        {diagnostics.status} / {diagnostics.lostTrackingCount}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt>Audio context / voices</dt>
-                      <dd>
-                        {audioState} / {audio.current.getDiagnostics().voices}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt>Browser base / output latency</dt>
-                      <dd>
-                        {(
-                          audio.current.getDiagnostics().baseLatency * 1000
-                        ).toFixed(1)}{" "}
-                        /{" "}
-                        {(
-                          audio.current.getDiagnostics().outputLatency * 1000
-                        ).toFixed(1)}{" "}
-                        ms
-                      </dd>
-                    </div>
-                    <div>
-                      <dt>Physical-to-sound latency</dt>
-                      <dd>Not measured</dd>
-                    </div>
-                    <div>
-                      <dt>MIDI</dt>
-                      <dd>{midiLabel}</dd>
-                    </div>
-                  </dl>
-                  <p>
-                    Browser audio figures and inference duration are not total
-                    latency. Benchmark the complete physical setup separately.
-                  </p>
+              )}
+              <button onClick={restart}>
+                <RotateCcw size={18} /> Retake picture
+              </button>
+              {shapes.length > 0 && (
+                <label className="switch">
+                  <input type="checkbox" checked={useLetters} onChange={(e) => toggleLetters(e.target.checked)} />
+                  Letters written in a shape set its note
+                </label>
+              )}
+              {controls.length > 0 && (
+                <details>
+                  <summary>Change instruments & notes</summary>
+                  <ul className="list">
+                    {controls.map((c, i) => {
+                      const voice = voiceOf(c);
+                      return (
+                        <li key={c.id}>
+                          <i className={`dot v-${voice}`} title={c.shape} />
+                          <select aria-label={`Instrument for shape ${i + 1}`} value={voice} onChange={(e) => setVoice(c, e.target.value as Voice)}>
+                            {VOICES.map(([v, name]) => (
+                              <option key={v} value={v}>{name}</option>
+                            ))}
+                          </select>
+                          <select
+                            aria-label={`Note for shape ${i + 1}`}
+                            value={c.action.type === "note" ? c.action.midi : c.action.type === "sound" ? c.action.sound : ""}
+                            onChange={(e) =>
+                              setAction(
+                                c.id,
+                                c.action.type === "note"
+                                  ? { type: "note", midi: Number(e.target.value), instrument: c.action.instrument }
+                                  : { type: "sound", sound: e.target.value },
+                              )
+                            }
+                          >
+                            {c.action.type === "note"
+                              ? NOTES.map((n) => <option key={n} value={n}>{noteName(n)}</option>)
+                              : (voice === "drums" ? DRUMS : FX).map((x) => <option key={x} value={x}>{x[0].toUpperCase() + x.slice(1)}</option>)}
+                          </select>
+                          <button className="x" aria-label="Remove shape" onClick={() => setControls((cs) => cs.filter((x) => x.id !== c.id))}>
+                            <X size={14} />
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
                 </details>
-                <p className="credit">
-                  Piano samples: Alexander Holm ·{" "}
-                  <a
-                    href="https://creativecommons.org/licenses/by/3.0/"
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    CC BY 3.0
-                  </a>
-                  . Trimmed, normalized, and repitched. Felt is a filtered
-                  preset. Samples have a finite decay; sustain does not loop
-                  them.
-                </p>
-                <div className="settings-bottom">
-                  <p>
-                    Local models. Local samples. Your session stays on this Mac.
-                  </p>
-                  <button className="button subtle" onClick={resetSession}>
-                    <RotateCcw size={14} />
-                    Reset session
-                  </button>
-                </div>
-              </>
-            )}
-          </section>
+              )}
+            </>
+          )}
+        </aside>
+      </main>
+      {notice && (
+        <div className="toast" role="status" onClick={() => setNotice("")}>
+          {notice}
         </div>
       )}
     </div>
   );
 }
+

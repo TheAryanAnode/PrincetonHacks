@@ -3,6 +3,7 @@ import type { Corners, PaperControl, Point } from "../types";
 import {
   computeHomography,
   controlsOverlap,
+  hitControl,
   homographyToCss,
   invertHomography,
   pointInPolygon,
@@ -172,5 +173,20 @@ describe("paper-space hit testing", () => {
       "horizontal",
       "vertical",
     ]);
+  });
+});
+
+describe("hitControl", () => {
+  const box = (id: string, x: number) => ({
+    id,
+    polygon: [[x, 0.2], [x + 0.1, 0.2], [x + 0.1, 0.8], [x, 0.8]] as Point[],
+  });
+  const controls = [box("a", 0.1), box("b", 0.4)];
+  it("prefers the shape under the point, then the nearest one in range", () => {
+    expect(hitControl([0.15, 0.5], controls)?.id).toBe("a");
+    expect(hitControl([0.24, 0.5], controls)?.id).toBe("a"); // 0.04 right of a
+    expect(hitControl([0.37, 0.5], controls)?.id).toBe("b"); // 0.03 left of b
+    expect(hitControl([0.3, 0.5], controls)).toBeUndefined(); // gap middle, too far
+    expect(hitControl([0.15, 0.95], controls)).toBeUndefined();
   });
 });

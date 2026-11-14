@@ -13,10 +13,25 @@ export interface HandFrame {
   landmarks: NormalizedLandmark[];
   /** Thumb/index distance divided by palm width. Lower = closed. Not surface contact. */
   pinch: number;
+  /** Index-knuckle to pinky-knuckle distance in normalized image units; 0 when no hand. */
+  palmWidth: number;
+  /** Every fingertip of every visible hand (up to 2). id = "<hand>:<finger 0-4>", finger 1 = index. */
+  fingers: Finger[];
   /** Handedness classification score; this is not a physical-contact confidence. */
   confidence: number;
   handedness: string | null;
 }
+
+export interface Finger {
+  id: string;
+  tip: Point;
+  palmWidth: number;
+}
+
+const TIPS = [4, 8, 12, 16, 20];
+const DIPS = [3, 7, 11, 15, 19]; // joint just behind each tip
+/** From a high, steep webcam the pad touching the paper sits a little past the tip landmark. */
+const CONTACT_REACH = 0.2;
 
 export interface TrackingDiagnostics {
   fps: number;
@@ -85,10 +100,11 @@ export class HandTracker {
       const fileset = await FilesetResolver.forVisionTasks(`${assetBase}/wasm`);
       const options = {
         runningMode: "VIDEO" as const,
-        numHands: 1,
-        minHandDetectionConfidence: 0.6,
-        minHandPresenceConfidence: 0.6,
-        minTrackingConfidence: 0.6,
+        numHands: 2,
+        // Lower than default: steep desk angles make MediaPipe less sure, and dropping a hand mid-press is worse than a stray frame.
+        minHandDetectionConfidence: 0.5,
+        minHandPresenceConfidence: 0.5,
+        minTrackingConfidence: 0.5,
       };
       let model: HandLandmarker;
       try {
@@ -288,12 +304,31 @@ export class HandTracker {
           palmWidth > 0.005
             ? distance(landmarks[4], landmarks[8]) / palmWidth
             : Infinity;
+        const fingers: Finger[] = [];
+        result.landmarks.forEach((hand, h) => {
+          if (hand.length < 21) return;
+          // Handedness keeps ids stable when MediaPipe reorders hands between frames.
+          let name = result.handedness[h]?.[0]?.categoryName ?? String(h);
+          if (fingers.some((f) => f.id.startsWith(`${name}:`))) name += h;
+          const width = distance(hand[5], hand[17]);
+          TIPS.forEach((t, f) => {
+            const tip = hand[t], dip = hand[DIPS[f]];
+            if (![tip.x, tip.y, dip.x, dip.y].every(Number.isFinite)) return;
+            fingers.push({
+              id: `${name}:${f}`,
+              tip: [tip.x + (tip.x - dip.x) * CONTACT_REACH, tip.y + (tip.y - dip.y) * CONTACT_REACH],
+              palmWidth: width,
+            });
+          });
+        });
         this.diagnostics.handVisible = true;
         this.onFrame?.({
           timestampMs,
           tip: [landmarks[8].x, landmarks[8].y],
           landmarks,
           pinch,
+          palmWidth,
+          fingers,
           confidence: result.handedness[0]?.[0]?.score ?? 0,
           handedness: result.handedness[0]?.[0]?.categoryName ?? null,
         });
@@ -319,6 +354,8 @@ export class HandTracker {
       tip: null,
       landmarks: [],
       pinch: Infinity,
+      palmWidth: 0,
+      fingers: [],
       confidence: 0,
       handedness: null,
     });

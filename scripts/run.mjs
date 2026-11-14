@@ -38,6 +38,7 @@ const inputs = [
   "package-lock.json",
   "tsconfig.json",
   "vite.config.ts",
+  "server",
 ];
 if (!existsSync(join(project, "node_modules")))
   throw new Error("Dependencies are missing. Run npm install first.");

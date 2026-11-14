@@ -1,4 +1,5 @@
-import type { ControlEvent, Mode, PaperControl } from "../types";
+import type { ControlEvent, Instrument, Mode, PaperControl } from "../types";
+import { PERCUSSIVE, renderNote } from "./synth";
 
 type Source = ControlEvent["source"];
 export type SoundPreset = "piano" | "felt" | "synth";
@@ -240,7 +241,12 @@ export class AudioEngine {
       return;
     const index = Number(control.id.match(/(\d+)$/)?.[1] ?? 0);
     const created: number[] = [];
-    if (mode === "drums" || mode === "soundboard") {
+    // Piano mode plays each control's own action, so AI-made layouts can mix keys and pads.
+    if (
+      mode === "drums" ||
+      mode === "soundboard" ||
+      control.action.type === "sound"
+    ) {
       const fallback =
         mode === "drums" ? DRUM_SOUNDS[index % 4] : BOARD_SOUNDS[index % 4];
       const requested =
@@ -268,6 +274,12 @@ export class AudioEngine {
         12,
         108,
       );
+      const instrument = control.action.type === "note" ? control.action.instrument : undefined;
+      if (instrument && instrument !== "piano") {
+        created.push(this.playBuffer(this.synthBuffer(instrument, root), 1, 0.5, PERCUSSIVE.has(instrument)));
+        this.ownership.hold(owner, created);
+        return;
+      }
       const offsets = mode === "chords" ? [0, root % 12 === 9 ? 3 : 4, 7] : [0];
       for (const offset of offsets)
         created.push(
@@ -275,6 +287,29 @@ export class AudioEngine {
         );
     }
     if (created.length) this.ownership.hold(owner, created);
+  }
+
+  private synthCache = new Map<string, AudioBuffer>();
+  /** Rendered once per instrument+pitch, then reused (see synth.ts). */
+  private synthBuffer(instrument: Exclude<Instrument, "piano">, midi: number): AudioBuffer {
+    const key = `${instrument}:${midi}`;
+    let buffer = this.synthCache.get(key);
+    if (!buffer) {
+      const context = this.context!;
+      const samples = renderNote(instrument, midi, context.sampleRate);
+      buffer = context.createBuffer(1, samples.length, context.sampleRate);
+      buffer.copyToChannel(samples, 0);
+      this.synthCache.set(key, buffer);
+    }
+    return buffer;
+  }
+
+  /** Pre-render synthesized notes for these controls so the first press is instant. */
+  warm(controls: PaperControl[]): void {
+    if (!this.context) return;
+    for (const c of controls)
+      if (c.action.type === "note" && c.action.instrument && c.action.instrument !== "piano")
+        this.synthBuffer(c.action.instrument, c.action.midi);
   }
 
   private playNote(midi: number, gain: number): number {

@@ -2,8 +2,11 @@ export type Point = [number, number];
 export type Mode = "piano" | "chords" | "drums" | "soundboard" | "game";
 export type Skin = "obsidian-ivory" | "smoked-glass" | "midnight-circuit";
 export type Stage = "setup" | "scan" | "studio";
+/** Pitched voices. "piano" uses the bundled samples; the rest are synthesized (src/lib/synth.ts). */
+export const INSTRUMENTS = ["piano", "marimba", "guitar", "bass", "organ", "synth"] as const;
+export type Instrument = (typeof INSTRUMENTS)[number];
 export type ControlAction =
-  | { type: "note"; midi: number }
+  | { type: "note"; midi: number; instrument?: Instrument }
   | { type: "sound"; sound: string }
   | { type: "game"; action: string };
 export interface PaperControl {
@@ -14,6 +17,8 @@ export interface PaperControl {
   action: ControlAction;
   color?: string;
   electrode?: number | null;
+  /** Drawn shape the AI saw (rectangle, circle, triangle…), for display. */
+  shape?: string;
 }
 export interface PaperLayout {
   version: 1;

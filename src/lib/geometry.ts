@@ -234,3 +234,42 @@ export function controlsOverlap(controls: PaperControl[]): string[] {
   }
   return [...overlapping];
 }
+
+function distanceToSegment([px, py]: Point, [ax, ay]: Point, [bx, by]: Point) {
+  const dx = bx - ax, dy = by - ay;
+  const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy || 1)));
+  return Math.hypot(px - ax - t * dx, py - ay - t * dy);
+}
+
+/**
+ * The control under `point`, else the nearest one whose outline is within `radius`.
+ * Fingertips and clicks land a little off the pencil line, so near misses still count.
+ * `aspect` (width / height) keeps the radius round on a non-square frame; radius is in heights.
+ */
+export function hitControl<T extends { polygon: Point[] }>(
+  point: Point,
+  controls: T[],
+  aspect = 1,
+  radius = 0.07,
+): T | undefined {
+  const scale = ([x, y]: Point): Point => [x * aspect, y];
+  // Inside one or more shapes (slanted neighbours can touch): take the nearest centre.
+  let best: T | undefined;
+  let bestD = Infinity;
+  for (const c of controls) {
+    if (!pointInPolygon(point, c.polygon)) continue;
+    const n = c.polygon.length;
+    const d = Math.hypot(...scale(point).map((v, k) => v - c.polygon.reduce((s, p) => s + scale(p)[k], 0) / n));
+    if (d < bestD) [best, bestD] = [c, d];
+  }
+  if (best) return best;
+  bestD = radius;
+  for (const c of controls) {
+    const poly = c.polygon.map(scale);
+    for (let i = 0; i < poly.length; i++) {
+      const d = distanceToSegment(scale(point), poly[i], poly[(i + 1) % poly.length]);
+      if (d < bestD) [best, bestD] = [c, d];
+    }
+  }
+  return best;
+}

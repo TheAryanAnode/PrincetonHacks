@@ -71,6 +71,12 @@ describe("fresh tracking observations", () => {
     frame();
     expect(model.detectForVideo).toHaveBeenCalledOnce();
     expect(onFrame.mock.calls[0][0].tip).toEqual([0.5, 0.4]);
+    // every fingertip is reported, index finger = finger 1
+    expect(onFrame.mock.calls[0][0].fingers).toHaveLength(5);
+    // contact point reaches 20% past the tip (0.4) away from its joint (0.5)
+    const [x, y] = onFrame.mock.calls[0][0].fingers[1].tip;
+    expect(x).toBeCloseTo(0.5);
+    expect(y).toBeCloseTo(0.38);
     vi.advanceTimersByTime(150);
     expect(onFrame.mock.calls.at(-1)?.[0].tip).toBeNull();
     expect(tracker.diagnostics.status).toBe("paused");
@@ -91,6 +97,8 @@ describe("fresh tracking observations", () => {
     expect(onFrame.mock.calls.at(-1)?.[0]).toMatchObject({
       tip: null,
       pinch: Infinity,
+      palmWidth: 0,
+      fingers: [],
     });
     expect(tracker.diagnostics.lostTrackingCount).toBe(1);
     tracker.dispose();
